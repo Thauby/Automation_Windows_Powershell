@@ -1,0 +1,218 @@
+$Server = $env:COMPUTERNAME
+$Details = @{} # Stockage des rÃ©sultats par check
+$ResultFinal = @{KO=$null} # Stockage des KO
+$State = "KO"
+$OS = (Get-CimInstance -ClassName Win32_OperatingSystem).Caption
+
+# -----Check CcmExec-----#
+
+try {
+    $SvcCcmExec = Get-Service -Name CcmExec -ErrorAction Stop
+    $Details.CcmExecStatus = $SvcCcmExec.Status.ToString()
+    if ($SvcCcmExec.Status -ne 'Running') { $ResultFinal.KO += " ServiceCcmexec" }
+} 
+catch {
+    $Details.CcmExecStatus = "Service CcmExec check failed: $($_.Exception.Message)"
+    $ResultFinal.KO += " ErrorSvcCcmexec"
+}
+
+# -----Check Registry LookupMPList-----#
+
+try {
+    $PathREGEDIT = Get-ItemProperty -Path "HKLM:\SOFTWARE\Microsoft\CCM" -ErrorAction Stop
+    $Details.LookupMPList = $PathREGEDIT.LookupMPList
+    if ($PathREGEDIT.LookupMPList -notmatch '.RED01.SVC|commun01.svc' ) { $ResultFinal.KO += " RegistryKeyMP" }
+} 
+catch {
+    $Details.LookupMPList = "Registry CCM missing/unreadable: $($_.Exception.Message)"
+    $ResultFinal.KO += " MissingKeyMP"
+}
+
+# -----Check Proxy WinHTTP-----#
+
+$ProxyHTTP = (netsh winhttp show proxy | Out-String) -replace '\r?\n',' '
+$Details.WinHttpProxy = $ProxyHTTP
+if ($ProxyHTTP -notmatch '(?i)Direct access|.RED01.SVC|commun01.svc') {$ResultFinal.KO += " ConfProxy"}
+
+
+# -----Check WMI service-----#
+
+try {
+    $SvcWmi = Get-Service -Name winmgmt -ErrorAction Stop
+    $Details.WinmgmtStatus = $SvcWmi.Status.ToString()
+    if ($SvcWmi.Status -ne 'Running') {
+        $ResultFinal.KO += " ServiceWMI"
+    }
+}
+catch {
+    $Details.WinmgmtStatus = "Winmgmt check failed: $($_.Exception.Message)"
+    $ResultFinal.KO += " ErrSvcWmi"
+}
+
+# -----Check WMI namespaces CCM-----#
+
+try { 
+    Get-WmiObject -Namespace root\ccm -Class sms_client -ErrorAction Stop | Out-Null
+    $Details.WmiClassCCM = "OK"
+    } 
+catch {
+    $Details.WmiClassCCM = "WmiClassCCM KO : $($_.Exception.Message)"
+    $ResultFinal.KO += " WmiClassCCM"
+}
+
+# -----Check WMI namespaces Defender-----#
+
+try {
+    Get-WmiObject -Namespace root\Microsoft\protectionmanagement -Class MSFT_MpComputerStatus -ErrorAction Stop | Out-Null
+    $Details.WmiClassDefender = "OK"
+} 
+catch {
+    $Details.WmiClassDefender = "Wmi Class Defender KO : $($_.Exception.Message)"
+    $ResultFinal.KO += " WmiClassDefender"
+}
+
+# -----Defender signature / Quick scan-----#
+
+$MaxDays = 2
+
+#-----Test 2012 or newer-----#
+If ( $OS -match "2012"){
+    try {
+        $mp = Get-WmiObject -Namespace root\Microsoft\protectionmanagement -Class MSFT_MpComputerStatus
+        $SignAge = $mp.AntivirusSignatureAge
+        $QSAge = $mp.QuickScanAge
+
+        if ($SignAge -gt $MaxDays) { $ResultFinal.KO += " SignatureAge" }
+        if ($QSAge -gt $MaxDays) { $ResultFinal.KO += " QuickScanAge" }
+    } 
+    catch {
+        $Details.SignatureAgeDays = "Get-MpComputerStatus failed: $($_.Exception.Message)"
+        $Details.QuickScanAgeDays = "Get-MpComputerStatus failed: $($_.Exception.Message)"
+        $ResultFinal.KO += " MpComputerStatus"
+    }
+}
+Else {
+    try {
+        $mp = Get-MpComputerStatus -ErrorAction Stop
+        $SignAge = (New-TimeSpan -Start $mp.AntispywareSignatureLastUpdated -End (Get-Date)).TotalDays
+        $QSAge = (New-TimeSpan -Start $mp.QuickScanEndTime -End (Get-Date)).TotalDays
+
+        $Details.SignatureAgeDays = [math]::Round($SignAge,2)
+        $Details.QuickScanAgeDays = [math]::Round($QSAge,2)
+
+        if ($SignAge -gt $MaxDays) { $ResultFinal.KO += " SignatureAge" }
+        if ($QSAge -gt $MaxDays) { $ResultFinal.KO += " QuickScanAge" }
+    } 
+    catch {
+        $Details.SignatureAgeDays = "Get-MpComputerStatus failed: $($_.Exception.Message)"
+        $Details.QuickScanAgeDays = "Get-MpComputerStatus failed: $($_.Exception.Message)"
+        $ResultFinal.KO += " MpComputerStatus"
+    }
+}
+
+# -----StateMessage.log-----#
+
+$PathLog = "C:\Windows\CCM\Logs\StateMessage.log"
+
+if (-not (Test-Path $PathLog)) {
+    $Details.CommClientSCCM = "StateMessage.log missing"
+    $ResultFinal.KO += " MissingStateMessageLog"
+} 
+else {
+    try {
+        $Lines = Get-Content -Path $PathLog -Tail 5000 -ErrorAction Stop
+        $SuccessLines = ($Lines -match '(?i)\bSuccessfully\b').Count -gt 0
+
+        if ($SuccessLines) {
+            $Details.CommClientSCCM = "OK"
+        }
+        else {
+            $ResultFinal.KO += " StateMessageLog"
+            $ErrLines = $Lines | Where-Object { $_ -match '(?i)\berror|failed\b' }
+            $Last1 = $ErrLines | Select-Object -Last 1
+            $Details.CommClientSCCM = ($Last1 -join "`n")
+            
+        }
+    } 
+    catch {
+        $Details.CommClientSCCM = "StateMessage.log read failed: $($_.Exception.Message)"
+        $ResultFinal.KO += " StateMessageLogReadFailed"
+    }
+}
+
+# -----Ports vers MP-----#
+
+$Details.PortsTest = @()
+$PortsResult = @()
+
+if ($Details.LookupMPList) {
+    $MPList = $Details.LookupMPList -split ';' | ForEach-Object { $_.Trim() } | Where-Object { $_ }
+    $PortsToCheck = @(80,443,10123)
+
+    foreach ($MPName in $MPList) {
+        foreach ($Port in $PortsToCheck) {
+            $TNC = (tnc -ComputerName $MPName -Port $Port -InformationLevel Quiet)
+            $PortsResult += [pscustomobject]@{Port=$Port; Ok=$TNC }
+        }
+    }
+    $Details.PortsTest = ($PortsResult | ForEach-Object { "$($_.Port) = $($_.ok)"}) -join " | "
+    $Expected = $MPList.Count * $PortsToCheck.Count
+    $CountTrue = ($PortsResult | Where-Object { $_.Ok }).Count
+    if ($Expected -gt 0 -and $CountTrue -ne $Expected) { $ResultFinal.KO += " PortSrvToMP" }
+}
+
+# -----CPU/RAM-----#
+
+$RAM = [math]::Round((Get-CimInstance Win32_ComputerSystem).TotalPhysicalMemory / 1GB)
+$vCPU = (Get-CimInstance Win32_ComputerSystem).NumberOfLogicalProcessors
+
+if ($RAM -lt 4) {
+    $Details.RAM_GB = "Current: $RAM GB RAM. Min required: 4GB RAM. "
+    $ResultFinal.KO += " ConfRAM"
+}
+Else {
+    $Details.RAM_GB = "$RAM GB"
+}
+
+
+if ($vCPU -lt 2) {
+    $Details.CPU_Cores = "Current: $vCPU vCPU. Min required: 2vCPU."
+    $ResultFinal.KO += " ConfvCPU" 
+}
+Else {
+    $Details.CPU_Cores = $vCPU
+}
+
+#-----Check Disk C: free space-----#
+
+$DiskC = Get-CimInstance Win32_LogicalDisk -Filter "DeviceID='C:'"
+$PercentFree = [math]::Round(($DiskC.FreeSpace / $DiskC.Size) * 100)
+
+if ($PercentFree -lt 5) {
+    $ResultFinal.KO += " DiskC Need Free Space"
+    $Details.DiskC = "Only $PercentFree free space on disk C"
+}
+Else {
+    $Details.DiskC = " $PercentFree free space on disk C"
+}
+
+
+#-----Create Result-----#
+
+if ($ResultFinal.KO -eq $null ) {$State = "OK"}
+if ($ResultFinal.KO -eq "StateMessageLog") {$ResultFinal.KO += " Need to ccmrepair"}
+
+#-----RÃ©sultat final-----#
+
+$TResult = [pscustomobject]@{
+    Server = $Server;
+    OS = $OS
+    State = $State;
+    FonctionKO = $ResultFinal.KO
+    } # Reformatge
+
+# Pour SCCM / JSON
+
+$TResult
+
+#$Details | ConvertTo-Json -Depth 8
