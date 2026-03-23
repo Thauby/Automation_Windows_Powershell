@@ -1,0 +1,87 @@
+#Ce script permet de lancer le script SCCM "Why_AV_Not_Compliant"
+#Il peut facilement s'adapter pour : Se connecter à SCCM | Lancer un script SCCM | Recolter des informations sur un script
+
+#-----Partie Connexion SCCM-----#
+
+# Site configuration
+$SiteCode = "TEST" # Site code 
+$ProviderMachineName = "SrvName.domaine.io" # SMS Provider machine name
+$initParams = @{}
+
+# Import the ConfigurationManager.psd1 module 
+if((Get-Module ConfigurationManager) -eq $null) {
+    Import-Module "$($ENV:SMS_ADMIN_UI_PATH)\..\ConfigurationManager.psd1" @initParams 
+}
+# Connect to the site's drive if it is not already present
+if((Get-PSDrive -Name $SiteCode -PSProvider CMSite -ErrorAction SilentlyContinue) -eq $null) {
+    New-PSDrive -Name $SiteCode -PSProvider CMSite -Root $ProviderMachineName @initParams
+}
+# Set the current location to be the site code.
+Set-Location "$($SiteCode):\" @initParams
+
+#-----Partie spécifique au lancement du script "Why_AV_Not_Compliant"-----#
+
+#-----Enter path for list server-----# #Ici je suis en attente pour prendre les données en direct sur le PowerBI
+#Mon csv se constitue d'une dizaine de champs delimite par ; et la premiere ligne sont des titres. Je suis interresse par les champs : "SITE CODE" & "SERVER NAME"
+$ListServer = @{}
+$ListServer = Get-Content "D:\Temp\TGR\data.csv" | ConvertFrom-Csv -Delimiter ',' #Je prends mon fichier et je crée des colonnes 
+$ListServer = $ListServer | Where-Object -Property "SITE CODE" -EQ $SiteCode | Select-Object -ExpandProperty "Metis Name" #Je recolte le nom des serveurs appartenant au SiteCode SCCM
+
+#-----Var for Start script-----#
+$result = ""
+$CollectionName = "COL_SCCM_Info_No_Compliant_AV" #Collection que j'utilise specialement pour ce script. Il faut la creer specialement pour ce script.
+$ScriptID = "F288FAAE-2AA2-4615-8FD6-F1D2185CA685" #ID cree lors de l'ajout du script dans SCCM
+
+#-----Suppression des srv dans la collection-----#
+$EmptyColl = Get-CMCollectionMember -CollectionName $CollectionName 
+$EmptyColl | ForEach-Object { Remove-CMDeviceCollectionDirectMembershipRule -CollectionName $CollectionName -ResourceId $EmptyColl.ResourceID -force -confirm:$false} 
+
+#-----Wait Collection empty-----# #SCCM est insynchrone, la suppression des membres de la collection peu être très long. On attend 10min max
+$MaxTry = 20
+$i = 0
+
+While ($EmptyColl -and $i -lt $MaxTry) {
+    $EmptyColl = Get-CMCollectionMember -CollectionName $CollectionName
+    $i++
+    Write-output "Vidange Collection" #On peut le supprimer pour avoir un script plus silencieux
+    Start-Sleep -Seconds 30
+}
+
+#-----On ajoute les nouveaux srv dans la collection-----#
+$FailedToAddColl = ""
+If ( -not $EmptyColl) { #Ici on check que notre collection est bien vide
+    foreach ($srv in $ListServer) {
+        $CMDevice = Get-CMDevice -Name $srv
+        if ($CMDevice.CNIsOnline -eq "true"){
+            Try {
+            add-CMDeviceCollectionDirectMembershipRule -CollectionName $CollectionName -ResourceId $CMDevice.ResourceID
+            }
+            Catch {
+            $FailedToAddColl += " $srv Failed to add coll"
+            }
+        }
+        Else {
+        $result += " $($CMDevice.Name) Offline"
+        }
+    }
+
+#-----Lancement du script-----#
+    $job = Invoke-CMScript -CollectionName $CollectionName -ScriptGuid $ScriptID -Verbose 4>&1 #Le verbose est tres important car il permet de recuperer l'ID du resultat
+    $TakeVerbose = (($job | Select-Object -ExpandProperty Message) -join ' ')
+    if ($TakeVerbose -match '(?i)OperationID\s*=+\s*(\d+)') {$OperationID = $matches[1] } #Complique mais on recupere l'ID, je cherche encore une solution plus simple
+
+#-----Mise en attente de la validation du script-----# #Attente de 5min, changement prevu car j'ai repere un champ pour avoir un resultat lors de la fin d'execution - Test en cours
+    Write-Output "Wait 5min for execution script : $(Get-Date)" 
+    Start-Sleep -Seconds 300
+
+#-----Resultat-----#
+    $result += (Get-WmiObject -ComputerName $ProviderMachineName -Namespace "root\sms\site_$SiteCode" -Class SMS_ScriptsExecutionStatus -Filter "ClientOperationID = $operationID").ScriptOutput
+     
+}
+Else {
+    Write-Output "Collection not empty for CIP site"
+}
+
+
+$result
+$FailedToAddColl
