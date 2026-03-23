@@ -1,10 +1,23 @@
-$Server = $env:COMPUTERNAME
-$Details = @{} # Stockage des rÃ©sultats par check
-$ResultFinal = @{KO=$null} # Stockage des KO
-$State = "KO"
-$OS = (Get-CimInstance -ClassName Win32_OperatingSystem).Caption
+#L'objectif de ce script est de fournir une premiere analyse sur pourquoi Windows Defender ne remonte pas compliant dans mon PowerBI
+#PowerBI s'appuie sur ServiceNow et SCCM
+#Les critères de compliant du PowerBI est : Date de signature -2j et dernier Quick Scan -2j
+#Les principales raisons d'erreur est : La synchro avec SCCM <-> Serveur | Le serveur est offline et son status ServiceNow est en production
+#Ce script est ajouté dans SCCM et il est lancé via le Script "Lancement_Script_Why_AV_not_Compliant"
+#Le script de lancement filtre les serveurs qu'on va analyser. Pour connaitre les filtres il faut se reporter à la description du script. PI le filtre majeur est l'etat du serveur (Online/Offline). 
+#Je vais check les propriétés suivantes dans l'ordre liste : 
+#Status du service SCCM | Cle de registre du serveur Defender | Regle de proxy | Status du service WMI | Check des NameSpace WMI SCCM et Defender existant | Check de la signature et du dernier Quick Scan
+#Check de la communication SCCM <-> Serveur | Check ouverture des ports necessaire | Check configuration RAM & vCPU | Check de l'espace disque C: | Création d'un resultat
+#Chaque check sera construit avec un "try" / "catch" afin de capturer les erreurs
 
-# -----Check CcmExec-----#
+#-----Declaration des variables pour la construction du resultat-----#
+
+$Server = $env:COMPUTERNAME
+$Details = @{} # Stockage des resultats par check
+$ResultFinal = @{KO=$null} # Stockage des KO
+$State = "KO" #Prend l'etat ok si tout les checks sont bon
+$OS = (Get-CimInstance -ClassName Win32_OperatingSystem).Caption #Pour savoir sur quel Systeme d'exploitation le script s'execute
+
+# -----Check Service SCCM-----#
 
 try {
     $SvcCcmExec = Get-Service -Name CcmExec -ErrorAction Stop
@@ -16,12 +29,12 @@ catch {
     $ResultFinal.KO += " ErrorSvcCcmexec"
 }
 
-# -----Check Registry LookupMPList-----#
+# -----Check Registry Server Defender-----#
 
 try {
     $PathREGEDIT = Get-ItemProperty -Path "HKLM:\SOFTWARE\Microsoft\CCM" -ErrorAction Stop
     $Details.LookupMPList = $PathREGEDIT.LookupMPList
-    if ($PathREGEDIT.LookupMPList -notmatch '.RED01.SVC|commun01.svc' ) { $ResultFinal.KO += " RegistryKeyMP" }
+    if ($PathREGEDIT.LookupMPList -notmatch 'SERVERNAME|SERVERNAME2' ) { $ResultFinal.KO += " RegistryKeyMP" }
 } 
 catch {
     $Details.LookupMPList = "Registry CCM missing/unreadable: $($_.Exception.Message)"
@@ -32,7 +45,7 @@ catch {
 
 $ProxyHTTP = (netsh winhttp show proxy | Out-String) -replace '\r?\n',' '
 $Details.WinHttpProxy = $ProxyHTTP
-if ($ProxyHTTP -notmatch '(?i)Direct access|.RED01.SVC|commun01.svc') {$ResultFinal.KO += " ConfProxy"}
+if ($ProxyHTTP -notmatch '(?i)Direct access|SERVERNAME|SERVERNAME2') {$ResultFinal.KO += " ConfProxy"} #Si aucun proxy est definit la commande sort direct access
 
 
 # -----Check WMI service-----#
@@ -75,9 +88,9 @@ catch {
 
 $MaxDays = 2
 
-#-----Test 2012 or newer-----#
-If ( $OS -match "2012"){
-    try {
+#-----Test 2012 or newer-----# #Pour info defender prend en compte au minima 2012 server
+If ( $OS -match "2012"){ #2012 n'a pas les memes commandes que les systemes d'exploitation plus recent, il faut donc filtrer
+    try { #Partie pour OS superieur a 2012
         $mp = Get-WmiObject -Namespace root\Microsoft\protectionmanagement -Class MSFT_MpComputerStatus
         $SignAge = $mp.AntivirusSignatureAge
         $QSAge = $mp.QuickScanAge
@@ -91,7 +104,7 @@ If ( $OS -match "2012"){
         $ResultFinal.KO += " MpComputerStatus"
     }
 }
-Else {
+Else { #Partie pour 2012
     try {
         $mp = Get-MpComputerStatus -ErrorAction Stop
         $SignAge = (New-TimeSpan -Start $mp.AntispywareSignatureLastUpdated -End (Get-Date)).TotalDays
@@ -111,10 +124,11 @@ Else {
 }
 
 # -----StateMessage.log-----#
+#Log qui fournit les erreurs entre le client est le Management Point SCCM
 
 $PathLog = "C:\Windows\CCM\Logs\StateMessage.log"
 
-if (-not (Test-Path $PathLog)) {
+if (-not (Test-Path $PathLog)) { #Verification que le fichier existe
     $Details.CommClientSCCM = "StateMessage.log missing"
     $ResultFinal.KO += " MissingStateMessageLog"
 } 
@@ -129,8 +143,8 @@ else {
         else {
             $ResultFinal.KO += " StateMessageLog"
             $ErrLines = $Lines | Where-Object { $_ -match '(?i)\berror|failed\b' }
-            $Last1 = $ErrLines | Select-Object -Last 1
-            $Details.CommClientSCCM = ($Last1 -join "`n")
+            $Last1 = $ErrLines | Select-Object -Last 1 #ici on peut modifier le 1 pour attraper le nombre de ligne d'erreur souhaité
+            $Details.CommClientSCCM = ($Last1 -join "`n") 
             
         }
     } 
@@ -140,7 +154,7 @@ else {
     }
 }
 
-# -----Ports vers MP-----#
+# -----Ports vers Management Point SCCM-----#
 
 $Details.PortsTest = @()
 $PortsResult = @()
@@ -202,7 +216,7 @@ Else {
 if ($ResultFinal.KO -eq $null ) {$State = "OK"}
 if ($ResultFinal.KO -eq "StateMessageLog") {$ResultFinal.KO += " Need to ccmrepair"}
 
-#-----RÃ©sultat final-----#
+#-----Resultat final-----#
 
 $TResult = [pscustomobject]@{
     Server = $Server;
@@ -211,8 +225,8 @@ $TResult = [pscustomobject]@{
     FonctionKO = $ResultFinal.KO
     } # Reformatge
 
-# Pour SCCM / JSON
+# Pour SCCM format JSON
 
 $TResult
 
-#$Details | ConvertTo-Json -Depth 8
+$Details | ConvertTo-Json -Depth 8
