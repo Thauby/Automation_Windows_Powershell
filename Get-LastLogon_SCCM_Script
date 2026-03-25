@@ -1,0 +1,129 @@
+<#
+.Synopsis
+   Dernieres connexions par utilisateur
+.DESCRIPTION
+   Recherche dans le journal d'evenement de securite les logs de connexions.
+   Filtres les utilisateurs et n'affiche que la derniere connexion.
+.EXAMPLE
+    Retourne les logons filtrés des 21 derniers jours (valeur par defaut)
+
+   .\Get-LastLogon.ps1
+
+.EXAMPLE
+    Retourne les logons filtrés des 5 derniers
+
+   .\Get-LastLogon.ps1 -DaysBack 5
+
+.EXAMPLE
+    Retourne les logons filtrés des 30 derniers. 
+    Le mode verbose permet d'afficher des informations complementaires et exporte les exclusions dans un csv.
+
+   .\Get-LastLogon.ps1 -DaysBack 30 -Verbose
+
+.OUTPUTS
+   [PSCustomObject]
+.NOTES
+   Requiert d'etre Administrateur pour acceder aux journaux
+#>
+[cmdletbinding()]
+Param(
+    [Parameter(Mandatory=$false)]
+    [ValidateRange(1,60)]
+    [int]
+    $DaysBack = 21 
+)
+
+#region Variables
+
+$ExcludeTargetUserOSF    = 'SEARCH_VALUE'
+$ExcludeTargetUserName   = @( "$($env:COMPUTERNAME)`$" )
+$ExcludeTargetDomainName = @(
+    'Window Manager' ,
+    'Font Driver Host',
+    'NT SERVICE' ,
+    'NT AUTHORITY'
+)
+
+#endregion Variables
+
+#region Script Variables
+
+$FilterHashtable = @{
+    LogName   = 'Security'
+    Id        = 4624
+    StartTime = (Get-Date).AddDays(- $DaysBack)
+}
+
+# Permet d'afficher le nom plutot que l'ID
+$hLogonType = @{
+    0 = 'System';
+    2 = 'Interactive';
+    3 = 'Network';
+    4 = 'Batch';
+    5 = 'Service';
+    6 = 'Proxy';
+    7 = 'Unlock';
+    8 = 'NetworkCleartext';
+    9 = 'NewCredentials';
+    10 = 'RemoteInteractive';
+    11 = 'CachedInteractive';
+    12 = 'CachedRemoteInteractive';
+    13 = 'CachedUnlock';
+}
+
+#endregion Script Variables 
+
+$Now = Get-Date
+$events = Get-WinEvent -FilterHashtable $FilterHashtable -ErrorAction stop
+Write-Verbose -Message "NumberOf Events : $(($events | Measure-Object ).count)"
+
+$Logons = @()
+$Exclusions=@()
+
+$events | ForEach-Object {
+    $xml = [xml]$_.ToXml()
+    $d = @{}
+    $xml.Event.EventData.Data | ForEach-Object{ $d[$_.Name] = $_.'#text' }
+
+    # Exclusions par le nom UserName ou DomainName
+    if (( $ExcludeTargetUserName   -contains $d.TargetUserName   ) -or 
+        ( $ExcludeTargetDomainName -contains $d.TargetDomainName ) -or 
+        ( $d.TargetUserName.StartsWith($ExcludeTargetUserOSF)    )) { 
+        
+        # Log les exclusions en mode Verbose
+        if( $PSBoundParameters.ContainsKey('Verbose') ){
+            $Exclusions += [pscustomobject]@{
+                TargetUserName   = $d.TargetUserName
+                TargetDomainName = $d.TargetDomainName
+            }
+        }
+    }        
+    Else{
+        $Logons += [pscustomobject]@{
+            ComputerName     = $env:COMPUTERNAME
+            TimeCreated      = $_.TimeCreated
+            TargetUserName   = $d.TargetUserName
+            TargetDomainName = $d.TargetDomainName
+            LogonType        = $hLogonType[([int]($d.LogonType))]
+            WorkstationName  = $d.WorkstationName
+        }
+    }  
+}
+
+Write-Verbose -Message "NumberOf Logons : $(($Logons | Measure-Object ).count)"
+
+# 1 ligne par user la plus recente
+$LastLogons = $Logons | Group-Object -Property TargetUserName | ForEach-Object { $_.Group | Sort-Object TimeCreated | Select-Object -Last 1 } 
+Write-Verbose -Message "NumberOf LastLogons : $(($LastLogons | Measure-Object ).count)"
+
+$ts= New-TimeSpan -Start $Now -End (Get-Date)
+Write-Verbose -Message "Time Elapsed : $($ts.TotalSeconds) sec."
+
+# Exporte les exclusions en mode Verbose
+if( $PSBoundParameters.ContainsKey('Verbose') ){
+    $CsvPath = "$($env:USERPROFILE)\Desktop\Exclusion.csv"
+    $Exclusions | Sort-Object TargetDomainName,TargetUserName | Export-Csv -Path $CsvPath -Force -Encoding UTF8 -NoTypeInformation -ErrorAction Continue
+    Write-Verbose -Message "Find Exclusions here : $CsvPath"
+}
+
+Write-Output $LastLogons
