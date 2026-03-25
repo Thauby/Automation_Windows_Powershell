@@ -1,0 +1,2 @@
+"$env:COMPUTERNAME : App : $((Get-ItemProperty HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\* | Where-Object {$_.DisplayName} | Select-Object -ExpandProperty Displayname) -join ' / ')"
+"$env:COMPUTERNAME : Role : $((Get-WindowsFeature | Where-Object {$_.installed -eq 'true' -and $_.featuretype -notlike 'feature'} | Select-Object -ExpandProperty Displayname) -join ' / ')"
